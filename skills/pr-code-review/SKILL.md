@@ -1,7 +1,7 @@
 ---
 name: pr-code-review
-description: Multi-perspective PR review for Godot 4 / C# projects. Runs a simplification pass, then a .NET, mathematician, and Godot specialist in parallel, then adjudicates their conflicting findings into one report with an ordered resolution plan. Use whenever the user wants a deep or multi-agent review of a branch or PR, or says 'pr review', 'review this PR', 'review my branch', 'deep review', 'review before merge', or '/pr-code-review'. Accepts an optional PR number or file paths.
-allowed-tools: Bash(git *), Bash(gh *), Read, Grep, Glob, Agent
+description: Multi-perspective PR review for Godot 4 / C# projects. Runs a simplification pass, then a .NET, mathematician, and Godot specialist in parallel, adjudicates their conflicting findings into one report with an ordered resolution plan, and can then apply the approved fixes. Use whenever the user wants a deep or multi-agent review of a branch or PR, or says 'pr review', 'review this PR', 'review my branch', 'deep review', 'review before merge', or '/pr-code-review'. Accepts an optional PR number or file paths.
+allowed-tools: Bash(git *), Bash(gh *), Read, Grep, Glob, Agent, AskUserQuestion
 argument-hint: "[PR# | file paths] [--all] [--base <ref>]"
 context: fork
 ---
@@ -54,11 +54,18 @@ Exclude entirely — never counted, never diffed:
 - **MATH-B** — 3 *distinct* hits fire:
   `angle|velocity|speed|radius|amplitude|frequency|interval|offset|probability|weight|chance|threshold|epsilon|ratio|percent|clamp|delta`
 - **GODOT-C** — 1 hit fires:
-  `using Godot|GD\.|GetNode|GetTree|QueueFree|\[Export|\[Signal|EmitSignal|_Ready|_Process|_PhysicsProcess|_Draw|_Input|Callable\.From|PackedScene|ResourceLoader|Tween|Area2D|Node2D|SubViewport`
+  `using Godot|GD\.|GetNode|GetTree|QueueFree|\[Export|\[Signal|EmitSignal|_Ready|_Process|_PhysicsProcess|_Draw|_Input|Callable\.From|PackedScene|ResourceLoader|Tween|Area2D|Node2D|SubViewport|FileAccess|DirAccess|ProjectSettings|ConfigFile|HttpRequest|TranslationServer|\bOS\.`
+
+  The `FileAccess|DirAccess|ProjectSettings|ConfigFile` half matters most for the `Kernel/`
+  and `Domain/` rows, where GODOT-C is the *only* thing that gates the Godot reviewer in —
+  these are Godot APIs that carry no `using Godot` on the changed line and would otherwise
+  slip a dependency-rule breach past the reviewer who would catch it.
 
 ### Orchestrator's own checks — always run, regardless of gating
 
-1. `grep -rn "using Godot" Kernel/ Domain/` — any hit is a **pre-declared P1 CRITICAL** (breaks the CI dependency rule). Pass it to Commander White as an orchestrator finding.
+1. `grep -rn --include="*.cs" "using Godot" Kernel/ Domain/` — any hit is a **pre-declared P1 CRITICAL** (breaks the CI dependency rule). Pass it to Commander White as an orchestrator finding.
+
+   `--include="*.cs"` is required. Without it the grep matches `Domain/CLAUDE.md`, which *documents* the rule, and fires a false CRITICAL on every run.
 2. If `data` files changed and `Docs/stage.schema.json` exists, check the changed stage JSON against it and report any conformance break the same way.
 
 These run even when every agent is gated out, so a data-only diff is never reviewed by nobody.
@@ -149,6 +156,17 @@ D2  path/other.cs:L12  stdlib:  manual clamp → Math.Clamp
 
 If zero agents are gated in, skip to Step 5 and record it in the ledger.
 
+### Lost reports — check every gated agent returned content
+
+An agent can complete with an **empty result payload**. Unhandled, that reviewer shows as `ran` with zero findings, which reads as a clean pass when it actually means the report was lost — the same "silence looks like approval" failure the gate ledger exists to prevent.
+
+For each gated agent, if the result is empty or contains no findings section:
+
+1. Re-request once: ask it to restate its findings in its output format, without re-running the review or re-reading files.
+2. If still empty, record it as `LOST — report not received` in the ledger and pass that to Commander White.
+
+Never let a lost report reach the Coverage table as `ran | 0 findings`.
+
 ## Step 5 — Wave C: Commander White
 
 One `Agent` call, `subagent_type: "commander-white-agent"`.
@@ -176,6 +194,66 @@ Scope: N files | M lines | <head> vs <base>
 ## Step 6 — Output
 
 Print Commander White's report unchanged. Add nothing except the scope header if it is missing.
+
+## Step 7 — Approval gate
+
+**Never execute anything without explicit approval.** Everything up to here is read-only; from here the working tree gets modified.
+
+If the report contains at least one Execution Brief, ask with `AskUserQuestion`:
+
+- **Apply all briefed steps** — every `SIMPLE` and `COMPLEX` brief, in plan order
+- **Apply selected steps** — the caller names which (follow up to collect them)
+- **Apply none** — stop; the report stands on its own
+
+Surface in the question how many steps are briefed, and how many are `HUMAN ONLY` and therefore excluded no matter what is chosen. If there are no briefs, skip Steps 7–8 entirely and say so.
+
+Before asking, run `git status --short`. If the tree is dirty, say so in the question — the caller should know 2E's edits will land on top of existing uncommitted work.
+
+**Never execute** — regardless of approval:
+
+- an `UNRESOLVED` contradiction
+- a step marked `HUMAN ONLY` (human-verified, or `risk: high`)
+- anything without a brief
+
+## Step 8 — Execution
+
+Dispatch approved steps **in plan order, one at a time, blocking on each**. Order matters — the plan is sequenced so no step works on code a later step deletes, and parallel edits to the same file would collide.
+
+Route by the brief's tag:
+
+| Tag | `subagent_type` |
+|---|---|
+| `SIMPLE` | `2e-agent` |
+| `COMPLEX` | `2e-complex-agent` |
+
+Pass the brief **verbatim**. Do not summarize, reformat, or "clarify" it — the brief is the contract, and Commander White wrote it at high effort precisely so the executor does not have to reason. Editing it here reintroduces the judgment the design removed.
+
+### Stop on failure
+
+If a step returns `BLOCKED` or `FAILED`, **halt the remaining steps** and report. Do not continue down the plan — later steps often assume earlier ones landed, and applying them onto a half-fixed tree compounds the problem.
+
+A `BLOCKED — anchor not found` almost always means Commander White's brief was written against stale or misread source. That is a plan defect, not an executor failure; report it that way.
+
+### Final report
+
+After execution, print:
+
+```markdown
+## Execution Report
+
+| # | Step | Tag | Status | Files |
+|---|---|---|---|---|
+| E1 | … | SIMPLE | APPLIED | `path.cs` |
+| E2 | … | COMPLEX | FAILED — verify | `a.cs`, `b.cs` |
+
+**Verify output:** <real output from each step — never summarize a red run as green>
+
+**Not executed:** every HUMAN ONLY / UNRESOLVED / halted step, with the reason.
+
+**Working tree:** `git status --short` after the run.
+```
+
+Then remind the caller that nothing was committed — 2E has no commit or push tools by design, so the changes are theirs to review and commit.
 
 ## Important
 
